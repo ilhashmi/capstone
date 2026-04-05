@@ -1,284 +1,252 @@
-# app.py
-import numpy as np
-import pandas as pd
 import streamlit as st
-from hijri_converter import Gregorian
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+import plotly.express as px
 from sklearn.ensemble import HistGradientBoostingRegressor
+from thefuzz import process
 
-# ----------------------------
-# PAGE SETUP
-# ----------------------------
-st.set_page_config(page_title="Demand Forecast & Restock", layout="wide")
-st.title("Demand Forecast & Restock Report")
+st.set_page_config(page_title="Inventory Intelligence", layout="wide")
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def read_csv(file) -> pd.DataFrame:
-    return pd.read_csv(file)
+def auto_map_columns(df_columns, required_fields):
+    mapping = {}
+    for req in required_fields:
+        match, score = process.extractOne(req, df_columns)
+        mapping[req] = match if score > 75 else None
+    return mapping
 
-def safe_to_datetime(df: pd.DataFrame, col: str) -> pd.Series:
-    # matches your original: '%d-%m-%Y-%I:%M %p'
-    return pd.to_datetime(df[col], format="%d-%m-%Y-%I:%M %p", errors="coerce")
+def croston_forecast(ts, periods=1):
+    d = np.array(ts)
+    if len(d) == 0: return [0] * periods
+    non_zero_idx = np.where(d > 0)[0]
+    if len(non_zero_idx) == 0: return [0] * periods
+    
+    demand = d[non_zero_idx]
+    intervals = np.diff(np.insert(non_zero_idx, 0, -1))
+    
+    alpha = 0.1
+    z, p = np.zeros(len(demand)), np.zeros(len(intervals))
+    z[0], p[0] = demand[0], intervals[0]
+    
+    for i in range(1, len(demand)):
+        z[i] = alpha * demand[i] + (1 - alpha) * z[i-1]
+        p[i] = alpha * intervals[i] + (1 - alpha) * p[i-1]
+        
+    forecast = z[-1] / p[-1] if p[-1] > 0 else 0
+    return [max(0, forecast)] * periods
 
-def get_hijri_features(date: pd.Timestamp):
-    h = Gregorian(date.year, date.month, date.day).to_hijri()
-    is_ramadan = 1 if h.month == 9 else 0
-    is_eid = 1 if (h.month == 10 and h.day <= 3) or (h.month == 12 and h.day >= 10) else 0
-    return h.month, is_ramadan, is_eid
-
-def build_monthly_data(sales_df: pd.DataFrame) -> pd.DataFrame:
-    sales_df = sales_df.copy()
-
-    sales_df["date_time"] = safe_to_datetime(sales_df, "date_time")
-    sales_df = sales_df.dropna(subset=["date_time"])
-
-    sales_df["year_month"] = sales_df["date_time"].dt.to_period("M")
-
-    monthly = (
-        sales_df.groupby(["year_month", "product_id", "branch", "category"], as_index=False)
-        .agg(
-            qty_purchased=("qty_purchased", "sum"),
-            subtotal=("subtotal", "mean"),
-            profit=("profit", "sum"),
-            cogs=("cogs", "mean"),
-        )
-    )
-
-    monthly["date"] = monthly["year_month"].dt.to_timestamp()
-    monthly = monthly.sort_values(["product_id", "branch", "date"])
-
-    hijri = monthly["date"].apply(lambda x: pd.Series(get_hijri_features(x)))
-    monthly[["hijri_month", "is_ramadan", "is_eid"]] = hijri
-
-    monthly["lag_1"] = monthly.groupby(["product_id", "branch"])["qty_purchased"].shift(1)
-    monthly["lag_12"] = monthly.groupby(["product_id", "branch"])["qty_purchased"].shift(12)
-    monthly["rolling_mean_3"] = (
-        monthly.groupby(["product_id", "branch"])["qty_purchased"]
-        .shift(1)
-        .rolling(window=3)
-        .mean()
-    )
-
-    return monthly
-
-@st.cache_resource(show_spinner=False)
-def train_model(train_df: pd.DataFrame, features: list[str], max_iter: int, random_state: int):
-    model = HistGradientBoostingRegressor(max_iter=max_iter, random_state=random_state)
-    X = train_df[features]
-    y = train_df["qty_purchased"]
+def ml_forecast(df_product, target_col='qty', periods=4):
+    if len(df_product) < 10:
+        return [df_product[target_col].mean()] * periods
+        
+    df_product = df_product.copy()
+    df_product['lag_1'] = df_product[target_col].shift(1)
+    df_product['lag_2'] = df_product[target_col].shift(2)
+    df_product['lag_3'] = df_product[target_col].shift(3)
+    df_product['rolling_mean_3'] = df_product[target_col].rolling(3).mean()
+    
+    train = df_product.dropna()
+    if len(train) < 5:
+        return croston_forecast(df_product[target_col].fillna(0), periods)
+        
+    X = train[['lag_1', 'lag_2', 'lag_3', 'rolling_mean_3']]
+    y = train[target_col]
+    
+    model = HistGradientBoostingRegressor(max_iter=50, min_samples_leaf=1)
     model.fit(X, y)
-    return model
+    
+    forecasts = []
+    current_data = train.iloc[-1].copy()
+    
+    for _ in range(periods):
+        x_pred = pd.DataFrame({
+            'lag_1': [current_data[target_col] if _ == 0 else forecasts[-1]],
+            'lag_2': [current_data['lag_1']],
+            'lag_3': [current_data['lag_2']],
+            'rolling_mean_3': [(current_data['lag_1'] + current_data['lag_2'] + (forecasts[-1] if _ > 0 else current_data[target_col]))/3]
+        })
+        
+        pred = model.predict(x_pred)[0]
+        forecasts.append(max(0, pred))
+        
+        current_data['lag_2'] = current_data['lag_1']
+        current_data['lag_1'] = forecasts[-1]
+        
+    return forecasts
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+def build_intelligence_matrix(df, lead_time_weeks):
+    facts = df.groupby('name').agg(
+        total_qty=('qty', 'sum'),
+        total_revenue=('subtotal', 'sum') if 'subtotal' in df.columns else ('qty', 'sum'),
+        total_profit=('profit', 'sum') if 'profit' in df.columns else ('qty', 'sum'),
+        last_sold=('date', 'max'),
+        first_sold=('date', 'min')
+    ).reset_index()
+    
+    max_date = df['date'].max()
+    facts['days_since_sold'] = (max_date - facts['last_sold']).dt.days
+    facts['lifespan_days'] = (facts['last_sold'] - facts['first_sold']).dt.days + 1
+    
+    facts = facts.sort_values('total_profit', ascending=False)
+    facts['cum_pct'] = facts['total_profit'].cumsum() / facts['total_profit'].sum()
+    facts['abc_class'] = np.where(facts['cum_pct'] <= 0.8, 'A',
+                         np.where(facts['cum_pct'] <= 0.95, 'B', 'C'))
+    
+    df_weekly = df.set_index('date').groupby(['name', pd.Grouper(freq='W')])['qty'].sum().reset_index()
+    
+    results = []
+    for product in facts['name'].unique():
+        prod_data = df_weekly[df_weekly['name'] == product].sort_values('date')
+        
+        all_weeks = pd.date_range(start=df_weekly['date'].min(), end=df_weekly['date'].max(), freq='W')
+        prod_data = prod_data.set_index('date').reindex(all_weeks, fill_value=0).reset_index()
+        prod_data = prod_data.rename(columns={'index': 'date', 'qty': 'qty'})
+        prod_data['name'] = product
+        
+        mean_qty = prod_data['qty'].mean()
+        std_qty = prod_data['qty'].std()
+        cv = (std_qty / mean_qty) if mean_qty > 0 else 1
+        xyz = 'X' if cv <= 0.5 else ('Y' if cv <= 1.0 else 'Z')
+        
+        sparsity = (prod_data['qty'] == 0).mean()
+        
+        forecast_horizon = max(1, int(lead_time_weeks))
+        
+        if sparsity > 0.4 or xyz == 'Z':
+            fcst = croston_forecast(prod_data['qty'], periods=forecast_horizon)
+            model_used = 'Croston (Intermittent)'
+        else:
+            fcst = ml_forecast(prod_data, target_col='qty', periods=forecast_horizon)
+            model_used = 'HistGradientBoost'
+            
+        total_lead_demand = sum(fcst)
+        
+        results.append({
+            'name': product,
+            'xyz_class': xyz,
+            'cv_score': cv,
+            'sparsity_pct': sparsity,
+            'model_used': model_used,
+            f'lead_demand_({forecast_horizon}w)': round(total_lead_demand, 2)
+        })
+        
+    forecast_df = pd.DataFrame(results)
+    final_df = pd.merge(facts, forecast_df, on='name')
+    
+    final_df['segment'] = final_df['abc_class'] + final_df['xyz_class']
+    
+    def generate_action(row):
+        if row['days_since_sold'] > 90:
+            return "Liquidate (Dead Stock)"
+        if row['segment'] in ['AX', 'AY', 'BX']:
+            return "Restock Aggressively"
+        if row['segment'] in ['AZ', 'BZ', 'CX', 'CY']:
+            return "Maintain Level"
+        return "Review / Reduce"
+        
+    final_df['suggested_action'] = final_df.apply(generate_action, axis=1)
+    
+    return final_df
 
-# Toggle-driven: hide product name + category columns from viewing (not downloads)
-SENSITIVE_COLS = {
-    "product_name", "Product Name", "product category", "Product Category",
-    "category", "Category", "cogs", "Cogs", "cost", "Cost", "profit", "Profit","subtotal"
-}
+st.title("📈 Enterprise Inventory Intelligence Engine")
+st.markdown("Optimize capital allocation, forecast demand using Hybrid ML, and identify actionable inventory risks.")
 
-def apply_privacy_view(df: pd.DataFrame, hide: bool) -> pd.DataFrame:
-    if not hide:
-        return df
-    cols_to_drop = [c for c in df.columns if c in SENSITIVE_COLS]
-    return df.drop(columns=cols_to_drop, errors="ignore")
+uploaded_file = st.file_uploader("1. Upload Raw Sales Data (CSV/Excel)", type=['csv', 'xlsx'])
 
-# ----------------------------
-# SIDEBAR
-# ----------------------------
-with st.sidebar:
-    st.header("Inputs")
-    sales_file = st.file_uploader("Upload sales_cleaned_adliya.csv", type=["csv"])
-    inv_file = st.file_uploader("Upload inventory_cleaned.csv", type=["csv"])
+if uploaded_file:
+    with st.spinner("Ingesting data..."):
+        if uploaded_file.name.endswith('.csv'):
+            df_raw = pd.read_csv(uploaded_file)
+        else:
+            df_raw = pd.read_excel(uploaded_file)
+            
+    st.success(f"Data ingested: {len(df_raw):,} rows, {df_raw.shape[1]} columns.")
+    
+    st.subheader("2. Business Configuration")
+    col1, col2 = st.columns(2)
+    with col1:
+        lead_time_days = st.number_input("Supplier Lead Time (Days)", min_value=1, value=14, help="How long does it take for stock to arrive after ordering?")
+    with col2:
+        agg_level = st.selectbox("Forecast Aggregation", ["Weekly (Recommended)", "Monthly"])
+    
+    lead_time_weeks = max(1, lead_time_days / 7)
+    
+    st.subheader("3. Data Mapping")
+    st.markdown("We attempted to auto-detect your columns. Please verify before processing.")
+    
+    required_cols = ['name', 'category', 'qty', 'date']
+    optional_cols = ['subtotal', 'cost', 'profit']
+    all_target_cols = required_cols + optional_cols
+    
+    raw_cols = df_raw.columns.tolist()
+    auto_maps = auto_map_columns(raw_cols, all_target_cols)
+    
+    mapping_results = {}
+    m_cols = st.columns(4)
+    
+    for i, target in enumerate(all_target_cols):
+        with m_cols[i % 4]:
+            is_req = "*" if target in required_cols else ""
+            default_val = raw_cols.index(auto_maps[target]) if auto_maps.get(target) in raw_cols else 0
+            mapping_results[target] = st.selectbox(
+                f"{target.capitalize()} {is_req}", 
+                ["-- Not Provided --"] + raw_cols, 
+                index=default_val + 1 if auto_maps.get(target) else 0
+            )
 
-    st.divider()
-    st.header("Forecast Settings")
-    forecast_month = st.text_input("Forecast month (YYYY-MM)", value="2026-02")
-    latest_month = st.text_input("Latest actual month (YYYY-MM)", value="2026-01")
+    if st.button("Initialize Engine & Generate Insights", type="primary"):
+        for req in required_cols:
+            if mapping_results[req] == "-- Not Provided --":
+                st.error(f"Missing mandatory mapping: {req}")
+                st.stop()
+                
+        with st.spinner("Running ML Forecasting & Profit Classification (This may take a minute)..."):
+            df_clean = pd.DataFrame()
+            for key, val in mapping_results.items():
+                if val != "-- Not Provided --":
+                    df_clean[key] = df_raw[val]
+            
+            df_clean['date'] = pd.to_datetime(df_clean['date'], format='%d-%m-%Y-%I:%M %p', errors='coerce')
 
-    st.divider()
-    st.header("Model Settings")
-    max_iter = st.slider("HistGB max_iter", min_value=50, max_value=500, value=200, step=25)
-    random_state = st.number_input("random_state", value=42, step=1)
+            if df_clean['date'].isna().any():
+                df_clean['date'] = df_clean['date'].fillna(
+                    pd.to_datetime(df_raw['date'], errors='coerce', dayfirst=True)
+                )
+            df_clean = df_clean.dropna(subset=['date'])
+            df_clean['qty'] = pd.to_numeric(df_clean['qty'], errors='coerce').fillna(0)
+            df_clean = df_clean[df_clean['qty'] > 0]
+            
+            for num_col in ['subtotal', 'cost', 'profit']:
+                if num_col in df_clean.columns:
+                    df_clean[num_col] = pd.to_numeric(df_clean[num_col], errors='coerce').fillna(0)
 
-    st.divider()
-    st.header("Inventory Policy")
-    safety_buffer = st.number_input("Safety buffer (units)", min_value=0, value=4, step=1)
+            final_matrix = build_intelligence_matrix(df_clean, lead_time_weeks)
+            
+            st.divider()
+            st.header("Executive Dashboard")
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Active SKUs", f"{len(final_matrix):,}")
+            c2.metric("Dead Stock (90d+)", f"{len(final_matrix[final_matrix['days_since_sold'] > 90]):,}")
+            if 'total_profit' in final_matrix.columns:
+                c3.metric("Total Profit", f"${final_matrix['total_profit'].sum():,.2f}")
+            c4.metric("Aggressive Restocks", f"{len(final_matrix[final_matrix['suggested_action'] == 'Restock Aggressively']):,}")
+            
+            st.subheader("Portfolio Segments (ABC-XYZ)")
+            segment_counts = final_matrix['segment'].value_counts().reset_index()
+            segment_counts.columns = ['Segment', 'Count']
+            fig = px.treemap(segment_counts, path=['Segment'], values='Count', color='Count', color_continuous_scale='Blues')
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.header("Privacy")
-    hide_sensitive = st.toggle("Hide product name/category", value=True)
-
-# ----------------------------
-# MAIN
-# ----------------------------
-if not sales_file or not inv_file:
-    st.info("Upload both CSV files from the sidebar to generate the restock report.")
-    st.stop()
-
-sales_df = read_csv(sales_file)
-inv_df = read_csv(inv_file)
-
-required_sales_cols = {"date_time", "product_id", "branch", "category", "qty_purchased", "subtotal", "profit", "cogs"}
-required_inv_cols = {"product_id", "stock_on_hand"}
-
-missing_sales = required_sales_cols - set(sales_df.columns)
-missing_inv = required_inv_cols - set(inv_df.columns)
-
-if missing_sales:
-    st.error(f"Sales file missing columns: {sorted(list(missing_sales))}")
-    st.stop()
-if missing_inv:
-    st.error(f"Inventory file missing columns: {sorted(list(missing_inv))}")
-    st.stop()
-
-with st.spinner("Building monthly dataset + features..."):
-    monthly_data = build_monthly_data(sales_df)
-
-train_df = monthly_data.dropna().copy()
-
-features = [
-    "subtotal",
-    "cogs",
-    "hijri_month",
-    "is_ramadan",
-    "is_eid",
-    "lag_1",
-    "lag_12",
-    "rolling_mean_3",
-]
-
-missing_feat = [c for c in features if c not in train_df.columns]
-if missing_feat:
-    st.error(f"Feature columns missing after processing: {missing_feat}")
-    st.stop()
-
-with st.spinner("Training model..."):
-    model = train_model(train_df, features, max_iter=int(max_iter), random_state=int(random_state))
-
-train_r2 = model.score(train_df[features], train_df["qty_purchased"])
-
-try:
-    latest_period = pd.Period(latest_month, freq="M")
-    forecast_period = pd.Period(forecast_month, freq="M")
-    forecast_date = forecast_period.to_timestamp()
-except Exception:
-    st.error("Invalid month format. Use YYYY-MM (example: 2026-02).")
-    st.stop()
-
-latest_state = monthly_data[monthly_data["year_month"] == latest_period].copy()
-if latest_state.empty:
-    st.error(f"No rows found for latest actual month = {latest_month}.")
-    st.stop()
-
-h_m, is_r, is_e = get_hijri_features(forecast_date)
-
-forecast_input = latest_state.copy()
-forecast_input["hijri_month"] = h_m
-forecast_input["is_ramadan"] = is_r
-forecast_input["is_eid"] = is_e
-
-# Use actuals from latest month as lag_1 for the forecast month
-forecast_input["lag_1"] = latest_state["qty_purchased"]
-
-# Predict demand
-forecast_input["predicted_demand"] = model.predict(forecast_input[features])
-
-total_forecast = (
-    forecast_input.groupby("product_id", as_index=False)["predicted_demand"].sum()
-    .rename(columns={"predicted_demand": "predicted_demand_feb"})
-)
-
-report = (
-    pd.merge(inv_df.copy(), total_forecast, on="product_id", how="left")
-    .fillna({"predicted_demand_feb": 0})
-)
-
-report["stock_needed"] = report["predicted_demand_feb"] + float(safety_buffer)
-report["restock_qty"] = np.maximum(0, report["stock_needed"] - report["stock_on_hand"])
-
-report["status"] = np.where(
-    report["stock_on_hand"] < report["predicted_demand_feb"],
-    "STOCKOUT RISK",
-    np.where(report["restock_qty"] > 0, "LOW STOCK", "HEALTHY"),
-)
-
-# ----------------------------
-# UI: KPIs
-# ----------------------------
-k1, k2 = st.columns(2)
-k1.metric("Products in report", f"{report['product_id'].nunique():,}")
-k2.metric("Total restock qty", f"{report['restock_qty'].sum():,.0f}")
-
-st.divider()
-
-# ----------------------------
-# UI: FILTERS
-# ----------------------------
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    status_filter = st.multiselect(
-        "Filter status",
-        options=["STOCKOUT RISK", "LOW STOCK", "HEALTHY"],
-        default=["STOCKOUT RISK", "LOW STOCK"],
-    )
-with c2:
-    min_restock = st.number_input("Min restock qty", min_value=0, value=0, step=1)
-with c3:
-    search = st.text_input("Search product_id (contains)", value="")
-
-filtered = report.copy()
-if status_filter:
-    filtered = filtered[filtered["status"].isin(status_filter)]
-filtered = filtered[filtered["restock_qty"] >= float(min_restock)]
-if search.strip():
-    filtered = filtered[filtered["product_id"].astype(str).str.contains(search.strip(), na=False)]
-
-status_order = {"STOCKOUT RISK": 0, "LOW STOCK": 1, "HEALTHY": 2}
-filtered["_status_rank"] = filtered["status"].map(status_order).fillna(99)
-filtered = (
-    filtered.sort_values(["_status_rank", "restock_qty"], ascending=[True, False])
-    .drop(columns=["_status_rank"])
-)
-
-# ----------------------------
-# UI: TABS
-# ----------------------------
-tab1, tab2, tab3 = st.tabs(["Restock Report", "Top Risks", "Data Preview"])
-
-with tab1:
-    st.subheader("Restock Report")
-    view_df = apply_privacy_view(filtered, hide_sensitive)
-    st.dataframe(view_df, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download CSV (filtered)",
-        data=to_csv_bytes(filtered),  # full data
-        file_name=f"Restock_Proposal_{forecast_month}.csv",
-        mime="text/csv",
-    )
-
-with tab2:
-    st.subheader("Top STOCKOUT RISK")
-    top_risk = (
-        report[report["status"] == "STOCKOUT RISK"]
-        .sort_values("restock_qty", ascending=False)
-        .head(50)
-    )
-    view_risk = apply_privacy_view(top_risk, hide_sensitive)
-    st.dataframe(view_risk, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download CSV (top risk)",
-        data=to_csv_bytes(top_risk),  # full data
-        file_name=f"Top_Stockout_Risk_{forecast_month}.csv",
-        mime="text/csv",
-    )
-
-with tab3:
-    st.subheader("Monthly Data (feature engineered) — sample")
-    view_monthly = apply_privacy_view(monthly_data.tail(200), hide_sensitive)
-    st.dataframe(view_monthly, use_container_width=True, hide_index=True)
+            st.subheader("Inventory Action Matrix")
+            st.dataframe(
+                final_matrix.sort_values(by=f'lead_demand_({max(1, int(lead_time_weeks))}w)', ascending=False),
+                use_container_width=True,
+                column_config={
+                    "total_profit": st.column_config.NumberColumn("Profit", format="$%f"),
+                    f'lead_demand_({max(1, int(lead_time_weeks))}w)': st.column_config.NumberColumn("Forecast Demand", help=f"Expected demand over the {lead_time_days} day lead time.")
+                }
+            )
+            
+            csv = final_matrix.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Action Matrix (CSV)", csv, "inventory_matrix.csv", "text/csv")
