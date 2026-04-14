@@ -291,6 +291,6 @@ Flow_f/
 
 ## Future Work
 
-- **LL):** Add LLM to give descriptive summaries in Inventory and Customer intelligence.
+- **LLM:** Add LLM to give descriptive summaries in Inventory and Customer intelligence.
 
 - **Stockout Analysis:** let user upload stock-on-hand and stockout reports to provide better analysis and predection.
