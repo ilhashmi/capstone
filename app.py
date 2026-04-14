@@ -1,252 +1,273 @@
-import streamlit as st
-import pandas as pd
+
+import io, warnings
+warnings.filterwarnings("ignore")
+from types import SimpleNamespace
+
 import numpy as np
-from datetime import timedelta
-import plotly.express as px
-from sklearn.ensemble import HistGradientBoostingRegressor
-from thefuzz import process
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(page_title="Inventory Intelligence", layout="wide")
+st.set_page_config(
+    page_title="Flow ERP",
+    page_icon="🔮",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def auto_map_columns(df_columns, required_fields):
-    mapping = {}
-    for req in required_fields:
-        match, score = process.extractOne(req, df_columns)
-        mapping[req] = match if score > 75 else None
-    return mapping
+from utils.styles import apply_theme
+from core.processor import load_file, smart_detect, preprocess, build_baskets
+from core.inventory_engine import (
+    build_monthly_grain, engineer_features, build_abc_xyz,
+    train_quantile_models, predict_next_period,
+    train_classifier, predict_stages,
+    build_facts, assemble_master, build_category_view,
+)
+from core.finance_engine import (
+    monthly_summary, branch_performance, category_contribution,
+    basket_trend, cogs_trend, employee_performance,
+    sku_velocity, sales_by_dow, sales_by_hour,
+    top10_customers, retention_frequency,
+)
+from core.churn_engine import (
+    build_customer_table, rfm_score, churn_risk,
+    customer_retention_rate, new_vs_returning,
+    pareto_customers, product_affinity, executive_summary,
+)
+import views.inventory_view as inv_view
+import views.financial_view as fin_view
+import views.customer_view  as cust_view
 
-def croston_forecast(ts, periods=1):
-    d = np.array(ts)
-    if len(d) == 0: return [0] * periods
-    non_zero_idx = np.where(d > 0)[0]
-    if len(non_zero_idx) == 0: return [0] * periods
-    
-    demand = d[non_zero_idx]
-    intervals = np.diff(np.insert(non_zero_idx, 0, -1))
-    
-    alpha = 0.1
-    z, p = np.zeros(len(demand)), np.zeros(len(intervals))
-    z[0], p[0] = demand[0], intervals[0]
-    
-    for i in range(1, len(demand)):
-        z[i] = alpha * demand[i] + (1 - alpha) * z[i-1]
-        p[i] = alpha * intervals[i] + (1 - alpha) * p[i-1]
-        
-    forecast = z[-1] / p[-1] if p[-1] > 0 else 0
-    return [max(0, forecast)] * periods
+apply_theme()
 
-def ml_forecast(df_product, target_col='qty', periods=4):
-    if len(df_product) < 10:
-        return [df_product[target_col].mean()] * periods
-        
-    df_product = df_product.copy()
-    df_product['lag_1'] = df_product[target_col].shift(1)
-    df_product['lag_2'] = df_product[target_col].shift(2)
-    df_product['lag_3'] = df_product[target_col].shift(3)
-    df_product['rolling_mean_3'] = df_product[target_col].rolling(3).mean()
-    
-    train = df_product.dropna()
-    if len(train) < 5:
-        return croston_forecast(df_product[target_col].fillna(0), periods)
-        
-    X = train[['lag_1', 'lag_2', 'lag_3', 'rolling_mean_3']]
-    y = train[target_col]
-    
-    model = HistGradientBoostingRegressor(max_iter=50, min_samples_leaf=1)
-    model.fit(X, y)
-    
-    forecasts = []
-    current_data = train.iloc[-1].copy()
-    
-    for _ in range(periods):
-        x_pred = pd.DataFrame({
-            'lag_1': [current_data[target_col] if _ == 0 else forecasts[-1]],
-            'lag_2': [current_data['lag_1']],
-            'lag_3': [current_data['lag_2']],
-            'rolling_mean_3': [(current_data['lag_1'] + current_data['lag_2'] + (forecasts[-1] if _ > 0 else current_data[target_col]))/3]
-        })
-        
-        pred = model.predict(x_pred)[0]
-        forecasts.append(max(0, pred))
-        
-        current_data['lag_2'] = current_data['lag_1']
-        current_data['lag_1'] = forecasts[-1]
-        
-    return forecasts
 
-def build_intelligence_matrix(df, lead_time_weeks):
-    facts = df.groupby('name').agg(
-        total_qty=('qty', 'sum'),
-        total_revenue=('subtotal', 'sum') if 'subtotal' in df.columns else ('qty', 'sum'),
-        total_profit=('profit', 'sum') if 'profit' in df.columns else ('qty', 'sum'),
-        last_sold=('date', 'max'),
-        first_sold=('date', 'min')
-    ).reset_index()
-    
-    max_date = df['date'].max()
-    facts['days_since_sold'] = (max_date - facts['last_sold']).dt.days
-    facts['lifespan_days'] = (facts['last_sold'] - facts['first_sold']).dt.days + 1
-    
-    facts = facts.sort_values('total_profit', ascending=False)
-    facts['cum_pct'] = facts['total_profit'].cumsum() / facts['total_profit'].sum()
-    facts['abc_class'] = np.where(facts['cum_pct'] <= 0.8, 'A',
-                         np.where(facts['cum_pct'] <= 0.95, 'B', 'C'))
-    
-    df_weekly = df.set_index('date').groupby(['name', pd.Grouper(freq='W')])['qty'].sum().reset_index()
-    
-    results = []
-    for product in facts['name'].unique():
-        prod_data = df_weekly[df_weekly['name'] == product].sort_values('date')
-        
-        all_weeks = pd.date_range(start=df_weekly['date'].min(), end=df_weekly['date'].max(), freq='W')
-        prod_data = prod_data.set_index('date').reindex(all_weeks, fill_value=0).reset_index()
-        prod_data = prod_data.rename(columns={'index': 'date', 'qty': 'qty'})
-        prod_data['name'] = product
-        
-        mean_qty = prod_data['qty'].mean()
-        std_qty = prod_data['qty'].std()
-        cv = (std_qty / mean_qty) if mean_qty > 0 else 1
-        xyz = 'X' if cv <= 0.5 else ('Y' if cv <= 1.0 else 'Z')
-        
-        sparsity = (prod_data['qty'] == 0).mean()
-        
-        forecast_horizon = max(1, int(lead_time_weeks))
-        
-        if sparsity > 0.4 or xyz == 'Z':
-            fcst = croston_forecast(prod_data['qty'], periods=forecast_horizon)
-            model_used = 'Croston (Intermittent)'
-        else:
-            fcst = ml_forecast(prod_data, target_col='qty', periods=forecast_horizon)
-            model_used = 'HistGradientBoost'
-            
-        total_lead_demand = sum(fcst)
-        
-        results.append({
-            'name': product,
-            'xyz_class': xyz,
-            'cv_score': cv,
-            'sparsity_pct': sparsity,
-            'model_used': model_used,
-            f'lead_demand_({forecast_horizon}w)': round(total_lead_demand, 2)
-        })
-        
-    forecast_df = pd.DataFrame(results)
-    final_df = pd.merge(facts, forecast_df, on='name')
-    
-    final_df['segment'] = final_df['abc_class'] + final_df['xyz_class']
-    
-    def generate_action(row):
-        if row['days_since_sold'] > 90:
-            return "Liquidate (Dead Stock)"
-        if row['segment'] in ['AX', 'AY', 'BX']:
-            return "Restock Aggressively"
-        if row['segment'] in ['AZ', 'BZ', 'CX', 'CY']:
-            return "Maintain Level"
-        return "Review / Reduce"
-        
-    final_df['suggested_action'] = final_df.apply(generate_action, axis=1)
-    
-    return final_df
+@st.cache_data(show_spinner=False)
+def run_pipeline(file_bytes: bytes, file_name: str, mapping_frozen: tuple, next_week: bool):
+    buf    = io.BytesIO(file_bytes)
+    df_raw = load_file(buf, file_name)
+    df     = preprocess(df_raw, dict(mapping_frozen))
+    baskets= build_baskets(df)
+    snapshot = pd.Timestamp(df["date"].max()) + pd.Timedelta(days=1)
+    df_pos = df[df["qty"] > 0].copy()
 
-st.title("📈 Enterprise Inventory Intelligence Engine")
-st.markdown("Optimize capital allocation, forecast demand using Hybrid ML, and identify actionable inventory risks.")
+    # Inventory ─────────────────────────────────────────────────────────────
+    monthly, le = build_monthly_grain(df)
+    featured    = engineer_features(monthly)
+    meta        = build_abc_xyz(monthly, df_pos)
+    meta_le     = meta.copy()
+    meta_le["cat_encoded"] = le.transform(
+        meta_le["category"].fillna("unknown").apply(
+            lambda x: x if x in le.classes_ else le.classes_[0]
+        )
+    )
+    m25, m50, m75, feat_imp = train_quantile_models(featured)
+    predictions = predict_next_period(featured, m25, m50, m75, next_week=next_week)
+    clf, _      = train_classifier(featured, meta_le)
+    stages      = predict_stages(clf, meta_le, featured)
+    facts       = build_facts(monthly, df_pos)
+    master      = assemble_master(predictions, meta, facts, stages, monthly)
+    cat_view    = build_category_view(monthly)
 
-uploaded_file = st.file_uploader("1. Upload Raw Sales Data (CSV/Excel)", type=['csv', 'xlsx'])
+    # Finance ───────────────────────────────────────────────────────────────
+    monthly_fin = monthly_summary(df, baskets)
+    branch_df   = branch_performance(df, baskets)
+    cat_df      = category_contribution(df)
+    bkt_trend   = basket_trend(baskets)
+    cogs_df     = cogs_trend(df)
+    emp_df      = employee_performance(df, baskets)
+    sku_df      = sku_velocity(df)
+    dow_df      = sales_by_dow(df)
+    hour_df     = sales_by_hour(df)
+    top_cust    = top10_customers(df)
+    ret_info    = retention_frequency(df)
 
-if uploaded_file:
-    with st.spinner("Ingesting data..."):
-        if uploaded_file.name.endswith('.csv'):
-            df_raw = pd.read_csv(uploaded_file)
-        else:
-            df_raw = pd.read_excel(uploaded_file)
-            
-    st.success(f"Data ingested: {len(df_raw):,} rows, {df_raw.shape[1]} columns.")
-    
-    st.subheader("2. Business Configuration")
-    col1, col2 = st.columns(2)
-    with col1:
-        lead_time_days = st.number_input("Supplier Lead Time (Days)", min_value=1, value=14, help="How long does it take for stock to arrive after ordering?")
-    with col2:
-        agg_level = st.selectbox("Forecast Aggregation", ["Weekly (Recommended)", "Monthly"])
-    
-    lead_time_weeks = max(1, lead_time_days / 7)
-    
-    st.subheader("3. Data Mapping")
-    st.markdown("We attempted to auto-detect your columns. Please verify before processing.")
-    
-    required_cols = ['name', 'category', 'qty', 'date']
-    optional_cols = ['subtotal', 'cost', 'profit']
-    all_target_cols = required_cols + optional_cols
-    
-    raw_cols = df_raw.columns.tolist()
-    auto_maps = auto_map_columns(raw_cols, all_target_cols)
-    
-    mapping_results = {}
-    m_cols = st.columns(4)
-    
-    for i, target in enumerate(all_target_cols):
-        with m_cols[i % 4]:
-            is_req = "*" if target in required_cols else ""
-            default_val = raw_cols.index(auto_maps[target]) if auto_maps.get(target) in raw_cols else 0
-            mapping_results[target] = st.selectbox(
-                f"{target.capitalize()} {is_req}", 
-                ["-- Not Provided --"] + raw_cols, 
-                index=default_val + 1 if auto_maps.get(target) else 0
+    # Customer ──────────────────────────────────────────────────────────────
+    cust_base = build_customer_table(df, baskets, snapshot)
+    crr_df    = customer_retention_rate(df)
+    if cust_base is not None and not cust_base.empty:
+        cust_rfm  = churn_risk(rfm_score(cust_base))
+        new_ret   = new_vs_returning(df, baskets)
+        pareto    = pareto_customers(cust_rfm)
+        affinity  = product_affinity(df)
+        exec_summ = executive_summary(cust_rfm, crr_df, snapshot)
+    else:
+        cust_rfm, new_ret, pareto, affinity, exec_summ = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
+
+    return SimpleNamespace(
+        df=df, baskets=baskets,
+        master=master, monthly_inv=monthly, featured=featured,
+        cat_view=cat_view, feat_imp=feat_imp,
+        monthly_fin=monthly_fin, branch=branch_df, cat=cat_df,
+        bkt_trend=bkt_trend, cogs=cogs_df, employee=emp_df,
+        sku=sku_df, dow=dow_df, hour=hour_df,
+        top_cust=top_cust, ret_info=ret_info,
+        cust_rfm=cust_rfm, crr=crr_df,
+        new_ret=new_ret, pareto=pareto, affinity=affinity,
+        exec_summ=exec_summ, snapshot=snapshot,
+        next_week=next_week,
+    )
+
+
+# Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## Flow ERP")
+    st.caption("Inventory · Finance · Customer Intelligence")
+    st.divider()
+
+    uploaded = st.file_uploader("Upload sales file", type=["csv", "xlsx", "xls"])
+
+
+# Welcome ───────────────────────────────────────────────────────────────────
+if uploaded is None:
+    st.markdown("## Flow ERP — Control Tower")
+    st.markdown(
+        "Upload a CSV or Excel sales export in the sidebar, map your columns, "
+        "and click **Run Analysis** to activate all three modules."
+    )
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            '<div class="info-box">'
+            '<b>📦 Inventory Intelligence</b><br>'
+            'LightGBM quantile forecasting (25/50/75 percentile) · '
+            'ABC×XYZ portfolio classification · Lifecycle staging</div>',
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            '<div class="info-box">'
+            '<b>💰 Financial Dashboard</b><br>'
+            'P&amp;L · Gross margin · COGS trend · Branch benchmarking · '
+            'Employee performance · Basket analytics</div>',
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            '<div class="info-box">'
+            '<b>👤 Customer Intelligence</b><br>'
+            'RFM quintile scoring · LightGBM churn risk · '
+            'Win-back priority list · Retention rate · Product affinity</div>',
+            unsafe_allow_html=True,
+        )
+    st.stop()
+
+
+# Column mapping ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    uploaded.seek(0)
+    try:
+        df_peek = load_file(io.BytesIO(uploaded.read()), uploaded.name)
+    except Exception as e:
+        st.error(str(e)); st.stop()
+
+    st.success(f"✓ {len(df_peek):,} rows · {df_peek.shape[1]} cols")
+    sug      = smart_detect(df_peek)
+    all_cols = ["(none)"] + list(df_peek.columns)
+
+    st.markdown("**Column Mapping**")
+
+    def _col(label, key, req=False):
+        default = sug.get(key)
+        idx = all_cols.index(default) if default in all_cols else 0
+        return st.selectbox(f"{label}{' *' if req else ''}", all_cols, index=idx, key=f"col_{key}")
+
+    col_id   = _col("Product ID",          "id",       req=True)
+    col_name = _col("Product Name",         "name",     req=True)
+    col_cat  = _col("Category",             "category", req=True)
+    col_qty  = _col("Qty",                  "qty",      req=True)
+    col_date = _col("Date / Time",          "date",     req=True)
+    col_sid  = _col("Sale / Transaction ID","sale_id",  req=True)
+
+    with st.expander("Financial columns"):
+        col_sub  = _col("Subtotal / Revenue", "subtotal")
+        col_cost = _col("Cost (COGS)",         "cost")
+        col_pft  = _col("Profit",             "profit")
+        col_sp   = _col("Selling Price",      "selling_price")
+
+    with st.expander("Operations & Customer"):
+        col_br   = _col("Branch",             "branch")
+        col_emp  = _col("Employee",           "employee")
+        col_cust = _col("Customer Name",      "customer")
+        col_cid  = _col("Customer ID",        "customer_id")
+
+    mapping = {k:v for k,v in [
+        ("id",col_id),("name",col_name),("category",col_cat),
+        ("qty",col_qty),("date",col_date),("sale_id",col_sid),
+        ("subtotal",col_sub),("cost",col_cost),("profit",col_pft),
+        ("branch",col_br),("employee",col_emp),("selling_price",col_sp),
+        ("customer",col_cust),("customer_id",col_cid),
+    ] if v != "(none)"}
+
+    missing = [k for k in ["id","name","category","qty","date","sale_id"] if k not in mapping]
+    if missing:
+        st.error(f"Map required columns: {', '.join(missing)}")
+        st.stop()
+
+    st.divider()
+    st.markdown("**Forecast Horizon**")
+    horizon   = st.radio(
+        "Predict for",
+        ["Next Month", "Next Week"],
+        help="Next Week scales the monthly model by 1/4.33 (proportional disaggregation).",
+    )
+    next_week = horizon == "Next Week"
+
+    run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
+
+
+# Run pipeline ──────────────────────────────────────────────────────────────
+if not run_btn and "R" not in st.session_state:
+    st.info("Map your columns in the sidebar, then click **Run Analysis**.")
+    st.stop()
+
+if run_btn or "R" not in st.session_state:
+    uploaded.seek(0)
+    with st.spinner("Running analysis…"):
+        try:
+            R = run_pipeline(
+                uploaded.read(), uploaded.name,
+                tuple(sorted(mapping.items())), next_week,
             )
+            st.session_state["R"] = R
+        except Exception as e:
+            st.error(f"Pipeline error: {e}")
+            import traceback; st.code(traceback.format_exc())
+            st.stop()
 
-    if st.button("Initialize Engine & Generate Insights", type="primary"):
-        for req in required_cols:
-            if mapping_results[req] == "-- Not Provided --":
-                st.error(f"Missing mandatory mapping: {req}")
-                st.stop()
-                
-        with st.spinner("Running ML Forecasting & Profit Classification (This may take a minute)..."):
-            df_clean = pd.DataFrame()
-            for key, val in mapping_results.items():
-                if val != "-- Not Provided --":
-                    df_clean[key] = df_raw[val]
-            
-            df_clean['date'] = pd.to_datetime(df_clean['date'], format='%d-%m-%Y-%I:%M %p', errors='coerce')
+R = st.session_state["R"]
+horizon_label = "Next Week" if R.next_week else "Next Month"
 
-            if df_clean['date'].isna().any():
-                df_clean['date'] = df_clean['date'].fillna(
-                    pd.to_datetime(df_raw['date'], errors='coerce', dayfirst=True)
-                )
-            df_clean = df_clean.dropna(subset=['date'])
-            df_clean['qty'] = pd.to_numeric(df_clean['qty'], errors='coerce').fillna(0)
-            df_clean = df_clean[df_clean['qty'] > 0]
-            
-            for num_col in ['subtotal', 'cost', 'profit']:
-                if num_col in df_clean.columns:
-                    df_clean[num_col] = pd.to_numeric(df_clean[num_col], errors='coerce').fillna(0)
+# Tabs ──────────────────────────────────────────────────────────────────────
+tab_inv, tab_fin, tab_cust = st.tabs([
+    "📦  Inventory Intelligence",
+    "💰  Financial Dashboard",
+    "👤  Customer Intelligence",
+])
 
-            final_matrix = build_intelligence_matrix(df_clean, lead_time_weeks)
-            
-            st.divider()
-            st.header("Executive Dashboard")
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Active SKUs", f"{len(final_matrix):,}")
-            c2.metric("Dead Stock (90d+)", f"{len(final_matrix[final_matrix['days_since_sold'] > 90]):,}")
-            if 'total_profit' in final_matrix.columns:
-                c3.metric("Total Profit", f"${final_matrix['total_profit'].sum():,.2f}")
-            c4.metric("Aggressive Restocks", f"{len(final_matrix[final_matrix['suggested_action'] == 'Restock Aggressively']):,}")
-            
-            st.subheader("Portfolio Segments (ABC-XYZ)")
-            segment_counts = final_matrix['segment'].value_counts().reset_index()
-            segment_counts.columns = ['Segment', 'Count']
-            fig = px.treemap(segment_counts, path=['Segment'], values='Count', color='Count', color_continuous_scale='Blues')
-            st.plotly_chart(fig, use_container_width=True)
+with tab_inv:
+    inv_view.render(
+        master=R.master, monthly=R.monthly_inv,
+        cat_view=R.cat_view, feat_imp=R.feat_imp,
+        horizon_label=horizon_label,
+    )
 
-            st.subheader("Inventory Action Matrix")
-            st.dataframe(
-                final_matrix.sort_values(by=f'lead_demand_({max(1, int(lead_time_weeks))}w)', ascending=False),
-                use_container_width=True,
-                column_config={
-                    "total_profit": st.column_config.NumberColumn("Profit", format="$%f"),
-                    f'lead_demand_({max(1, int(lead_time_weeks))}w)': st.column_config.NumberColumn("Forecast Demand", help=f"Expected demand over the {lead_time_days} day lead time.")
-                }
-            )
-            
-            csv = final_matrix.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Action Matrix (CSV)", csv, "inventory_matrix.csv", "text/csv")
+with tab_fin:
+    fin_view.render(
+        df=R.df, baskets=R.baskets,
+        monthly=R.monthly_fin,
+        branch_df=R.branch, cat_df=R.cat,
+        sku_df=R.sku, employee_df=R.employee,
+        top_cust=R.top_cust,
+        basket_trend_df=R.bkt_trend,
+        cogs_df=R.cogs, payment_df=None,
+        dow_df=R.dow, hour_df=R.hour,
+        retention_info=R.ret_info,
+    )
+
+with tab_cust:
+    cust_view.render(
+        df=R.df, baskets=R.baskets,
+        cust_rfm=R.cust_rfm, crr_df=R.crr,
+        new_ret_df=R.new_ret, pareto_df=R.pareto,
+        affinity_df=R.affinity, summary=R.exec_summ,
+    )
