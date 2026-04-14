@@ -291,8 +291,6 @@ Flow_f/
 
 ## Future Work
 
-- **Time-series cross-validation (TimeSeriesSplit):** replace the current all-history training with walk-forward validation to produce held-out forecast accuracy metrics (MAPE, RMSE per quantile).
+- **LL):** Add LLM to give descriptive summaries in Inventory and Customer intelligence.
 
-- **Uplift modelling for win-back campaigns:** estimate the incremental revenue impact of targeting specific at-risk customer segments, rather than ranking by LTV alone.
-
-- **Anomaly detection:** flag unusual sales spikes or drops using statistical process control (e.g. CUSUM) to separate genuine demand shifts from data entry errors.
+- **Stockout Analysis:** let user upload stock-on-hand and stockout reports to provide better analysis and predection.
