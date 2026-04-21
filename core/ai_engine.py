@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "Enter you API"
 _API_URL           = "https://openrouter.ai/api/v1/chat/completions"
 
 _FREE_MODELS = [
