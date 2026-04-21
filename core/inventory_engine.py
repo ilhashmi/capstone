@@ -35,7 +35,7 @@ CLF_FEATURES = [
 
 XYZ_X_THRESH    = 0.75
 XYZ_Z_THRESH    = 1.50
-WEEKS_PER_MONTH = 4.333   # average weeks per calendar month
+WEEKS_PER_MONTH = 4.333
 
 STRATEGY_MAP = {
     "AX":"ML · full investment",   "AY":"ML · full investment",
@@ -48,7 +48,7 @@ STRATEGY_MAP = {
 
 # 1. MONTHLY GRAIN ────────────────────────────────────────────────────────
 
-def build_monthly_grain(df: pd.DataFrame):
+def build_monthly_grain(df):
     pos = df[df["qty"] > 0].copy()
     prod_m = pos.groupby(
         ["base_id","name","category", pd.Grouper(key="date", freq="ME")]
@@ -102,8 +102,8 @@ def build_monthly_grain(df: pd.DataFrame):
 
 # 2. FEATURE ENGINEERING ──────────────────────────────────────────────────
 
-def engineer_features(monthly: pd.DataFrame) -> pd.DataFrame:
-    def _features_for_product(grp: pd.DataFrame) -> pd.DataFrame:
+def engineer_features(monthly):
+    def _features_for_product(grp):
         grp  = grp.sort_values("month").reset_index(drop=True)
         qty  = grp["qty_sold"]
         lagged = qty.shift(1)                       
@@ -143,10 +143,9 @@ def engineer_features(monthly: pd.DataFrame) -> pd.DataFrame:
         ).fillna(0.0)
         return grp
 
-    featured = (
-        monthly.groupby("base_id", group_keys=False)
-               .apply(_features_for_product)
-               .reset_index(drop=True)
+    featured = pd.concat(
+        [_features_for_product(grp) for _, grp in monthly.groupby("base_id", sort=False)],
+        ignore_index=True,
     )
     for f in FEATURE_COLS:
         if f not in featured.columns:
@@ -156,7 +155,7 @@ def engineer_features(monthly: pd.DataFrame) -> pd.DataFrame:
 
 # 3. ABC × XYZ
 
-def build_abc_xyz(monthly: pd.DataFrame, df_pos: pd.DataFrame) -> pd.DataFrame:
+def build_abc_xyz(monthly, df_pos):
     tot = (monthly.groupby("base_id")["qty_sold"].sum()
            .reset_index(name="total_qty").sort_values("total_qty", ascending=False))
     tot["cum_pct"] = tot["total_qty"].cumsum() / tot["total_qty"].sum() * 100
@@ -197,7 +196,7 @@ def build_abc_xyz(monthly: pd.DataFrame, df_pos: pd.DataFrame) -> pd.DataFrame:
 
 # 4. TRAIN MODELS ─────────────────────────────────────────────────────────
 
-def train_quantile_models(featured: pd.DataFrame):
+def train_quantile_models(featured):
     train = featured.dropna(subset=["lag1_qty"]).copy()
     for f in FEATURE_COLS:
         train[f] = pd.to_numeric(train.get(f, 0), errors="coerce").fillna(0)
@@ -229,7 +228,7 @@ def predict_next_period(
     target_month_num: int  = None,
     n_weekend_days:   int  = 9,
     is_ramadan:       int  = 0,
-) -> pd.DataFrame:
+):
     if target_month_num is None:
         target_month_num = (featured["month"].max() + pd.DateOffset(months=1)).month
 
@@ -279,7 +278,7 @@ def predict_next_period(
 
 # 6. LIFECYCLE CLASSIFIER ─────────────────────────────────────────────────
 
-def train_classifier(featured: pd.DataFrame, meta: pd.DataFrame):
+def train_classifier(featured, meta):
     last_feat = featured.groupby("base_id").last()[
         ["roll3_mean","trend_slope","velocity","cat_share","margin_pct","cat_encoded"]
     ].reset_index()
@@ -304,7 +303,7 @@ def train_classifier(featured: pd.DataFrame, meta: pd.DataFrame):
     return clf, prod[["base_id","stage_label"]]
 
 
-def predict_stages(clf, meta: pd.DataFrame, featured: pd.DataFrame) -> pd.Series:
+def predict_stages(clf, meta, featured):
     last_feat = featured.groupby("base_id").last()[
         ["roll3_mean","trend_slope","velocity","cat_share","margin_pct","cat_encoded"]
     ].reset_index()
@@ -318,7 +317,7 @@ def predict_stages(clf, meta: pd.DataFrame, featured: pd.DataFrame) -> pd.Series
 
 # 7. HISTORICAL FACTS ─────────────────────────────────────────────────────
 
-def build_facts(monthly: pd.DataFrame, df_pos: pd.DataFrame) -> pd.DataFrame:
+def build_facts(monthly, df_pos):
     monthly = monthly.copy()
     monthly["month"] = pd.to_datetime(monthly["month"])
     last_m  = monthly["month"].max()
@@ -352,7 +351,7 @@ def build_facts(monthly: pd.DataFrame, df_pos: pd.DataFrame) -> pd.DataFrame:
 
 # 8. MASTER TABLE ──────────────────────────────────────────────────────────
 
-def assemble_master(predictions, meta, facts, stages, monthly) -> pd.DataFrame:
+def assemble_master(predictions, meta, facts, stages, monthly):
     name_cat = monthly.groupby("base_id").agg(name=("name","first"), category=("category","first")).reset_index()
     master = (
         predictions
@@ -377,7 +376,7 @@ def assemble_master(predictions, meta, facts, stages, monthly) -> pd.DataFrame:
 
 # 9. CATEGORY VIEW ─────────────────────────────────────────────────────────
 
-def build_category_view(monthly: pd.DataFrame) -> pd.DataFrame:
+def build_category_view(monthly):
     cat = monthly.groupby(["category","month"]).agg(
         qty_sold    =("qty_sold",    "sum"),
         revenue     =("revenue",     "sum"),

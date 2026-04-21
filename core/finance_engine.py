@@ -42,7 +42,7 @@ def branch_performance(df, baskets):
     )
     return rev.merge(txn, on=["branch","month_str"], how="left")
 
-def category_contribution(df: pd.DataFrame) -> pd.DataFrame:
+def category_contribution(df):
     pos = df[df["qty"]>0].copy()
     c = pos.groupby("category").agg(
         revenue   =("revenue","sum"),

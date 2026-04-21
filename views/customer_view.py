@@ -1,189 +1,388 @@
-"""
-views/customer_view.py — Customer Intelligence & Churn Risk, dark theme.
-"""
 import datetime
+import hashlib
+import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-from utils.styles import PLOTLY, C, SEG_COLORS, CHURN_COLORS, kpi, sec_hdr, badge
+from core import ai_engine
+from utils.styles import PLOTLY, C, SEG_COLORS, CHURN_COLORS, kpi, sec_hdr, module_header, tbl_wrap, empty_state, badge, traffic_light
 
 
 def _L(**kw):
-    d = dict(**PLOTLY); d.update(kw); return d
+    d = dict(**PLOTLY)
+    d.update(kw)
+    return d
 
 
 def render(df, baskets, cust_rfm, crr_df, new_ret_df, pareto_df, affinity_df, summary):
-    st.markdown('<div class="sec-hdr">Customer Intelligence & Churn Risk</div>', unsafe_allow_html=True)
+    module_header("👤", "Customer Intelligence", "RFM segmentation · Churn risk AI · Retention analytics · Win-back lists")
 
     if cust_rfm is None or cust_rfm.empty:
         st.markdown(
-            '<div class="warn-box">Map a Customer ID / Name column to unlock this module.</div>',
-            unsafe_allow_html=True); return
+            '<div class="warn-box">⚠️ Map a <b>Customer ID</b> or <b>Customer Name</b> column to unlock this module.</div>',
+            unsafe_allow_html=True,
+        )
+        return
 
-    # ── Level 1: Executive Header ─────────────────────────────────────────────
-    sec_hdr("Executive Status")
-    c1,c2,c3,c4 = st.columns(4)
+    # ── Executive Status ──────────────────────────────────────────────────────
+    sec_hdr("Executive Status", "📋")
+    c1, c2, c3, c4 = st.columns(4)
+
     with c1:
         crr_val = summary.get("last_crr")
         kpi("Customer Retention Rate",
-            f"{crr_val:.1f}" if crr_val else "—", suffix="%" if crr_val else "",
-            sub=f"6-mo avg: {summary.get('avg_crr_6m','—')}%",
-            delta=summary.get("crr_trend"))
+            f"{crr_val:.1f}" if crr_val else "—",
+            suffix="%" if crr_val else "",
+            sub=f"6-mo avg: {summary.get('avg_crr_6m', '—')}%",
+            delta=summary.get("crr_trend"),
+            accent="green" if crr_val and crr_val >= 70 else "yellow" if crr_val else None)
+
     with c2:
-        kpi("Active Customers (90d)", f"{summary.get('active_90d',0):,}")
+        kpi("Active Customers (90d)", f"{summary.get('active_90d', 0):,}",
+            accent="blue")
+
     with c3:
-        kpi("Average LTV", f"{summary.get('avg_ltv',0):,.1f}", sub="Lifetime value")
+        kpi("Average LTV", f"{summary.get('avg_ltv', 0):,.1f}",
+            sub="Lifetime value", accent="blue")
+
     with c4:
-        tl = summary.get("churn_traffic_light","gray")
-        tl_label = {"green":"Healthy","yellow":"Monitor","red":"Alert"}.get(tl,"—")
-        tl_color = {"green":C["green"],"yellow":C["yellow"],"red":C["red"]}.get(tl,C["gray"])
-        at_risk   = summary.get("at_risk_pct",0)
+        tl = summary.get("churn_traffic_light", "gray")
+        tl_label  = {"green": "Healthy", "yellow": "Monitor", "red": "Alert"}.get(tl, "—")
+        tl_color  = {"green": C["green"], "yellow": C["yellow"], "red": C["red"]}.get(tl, C["gray"])
+        at_risk   = summary.get("at_risk_pct", 0)
+        tl_html   = traffic_light(tl)
         st.markdown(f"""<div class="kpi-card">
   <div class="kpi-label">Churn Alert</div>
-  <div class="kpi-value" style="color:{tl_color};font-size:18px">{tl_label}</div>
+  <div class="kpi-value" style="color:{tl_color};font-size:20px;display:flex;align-items:center;gap:8px">
+      {tl_html} {tl_label}
+  </div>
   <div class="kpi-sub">{at_risk:.1f}% of customers at risk</div>
-  <div class="kpi-sub">Revenue at risk: {summary.get('revenue_at_risk',0):,.0f}</div>
+  <div class="kpi-sub">Revenue at risk: {summary.get('revenue_at_risk', 0):,.0f}</div>
 </div>""", unsafe_allow_html=True)
 
+    # ── CRR Trend ─────────────────────────────────────────────────────────────
     if crr_df is not None and not crr_df.empty:
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=crr_df["month"], y=crr_df["crr_pct"],
             mode="lines+markers+text",
             text=[f"{v:.0f}%" for v in crr_df["crr_pct"]],
-            textposition="top center", textfont=dict(size=11,color=C["teal"]),
-            line=dict(color=C["teal"],width=2), marker=dict(size=7),
-            hovertemplate="<b>%{x}</b><br>CRR: %{y:.1f}%<extra></extra>"))
+            textposition="top center", textfont=dict(size=11, color=C["teal"]),
+            line=dict(color=C["teal"], width=2), marker=dict(size=7),
+            fill="tozeroy", fillcolor="rgba(45,212,191,0.06)",
+            hovertemplate="<b>%{x}</b><br>CRR: %{y:.1f}%<extra></extra>",
+        ))
         avg_crr = crr_df["crr_pct"].mean()
         fig.add_hline(y=avg_crr, line_dash="dot", line_color=C["faint"],
                       annotation_text=f"Avg {avg_crr:.1f}%",
                       annotation_font_color=C["faint"])
-        fig.update_layout(**_L(title="Customer Retention Rate — Month by Month",
-            height=240, xaxis_title="Month", yaxis_title="Retention Rate %"))
+        fig.update_layout(**_L(
+            title="Customer Retention Rate — Month by Month",
+            height=240, xaxis_title="Month", yaxis_title="Retention Rate %",
+        ))
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
 
-    # ── Level 2: Behavioral Engine ────────────────────────────────────────────
-    sec_hdr("Behavioral Engine")
+    # ── Behavioral Engine ─────────────────────────────────────────────────────
+    sec_hdr("Behavioral Engine", "🧠")
     cl, cr = st.columns(2)
+
     with cl:
         seg_c = cust_rfm["rfm_segment"].value_counts().reset_index()
-        seg_c.columns = ["segment","count"]
-        seg_c = seg_c.sort_values("count",ascending=True)
+        seg_c.columns = ["segment", "count"]
+        seg_c = seg_c.sort_values("count", ascending=True)
         fig2 = go.Figure(go.Bar(
             y=seg_c["segment"], x=seg_c["count"], orientation="h",
-            marker_color=[SEG_COLORS.get(s,C["gray"]) for s in seg_c["segment"]],
+            marker_color=[SEG_COLORS.get(s, C["gray"]) for s in seg_c["segment"]],
             opacity=0.85,
-            hovertemplate="<b>%{y}</b>: %{x} customers<extra></extra>"))
-        fig2.update_layout(**_L(title="RFM Customer Segments",
-            height=320, xaxis_title="Number of Customers", yaxis_title="RFM Segment"))
+            hovertemplate="<b>%{y}</b>: %{x} customers<extra></extra>",
+        ))
+        fig2.update_layout(**_L(
+            title="RFM Customer Segments",
+            height=320, xaxis_title="Number of Customers", yaxis_title="RFM Segment",
+        ))
         st.plotly_chart(fig2, use_container_width=True)
 
     with cr:
         if new_ret_df is not None and not new_ret_df.empty:
             fig3 = go.Figure()
-            fig3.add_trace(go.Bar(x=new_ret_df["month_str"],
-                y=new_ret_df.get("Returning",0), name="Returning",
-                marker_color=C["green"], opacity=0.82,
-                hovertemplate="<b>%{x}</b><br>Returning: %{y:,.1f}<extra></extra>"))
-            fig3.add_trace(go.Bar(x=new_ret_df["month_str"],
-                y=new_ret_df.get("New",0), name="New",
-                marker_color=C["blue"], opacity=0.82,
-                hovertemplate="<b>%{x}</b><br>New: %{y:,.1f}<extra></extra>"))
-            fig3.update_layout(**_L(title="New vs Returning Customer Revenue",
+            fig3.add_trace(go.Bar(
+                x=new_ret_df["month_str"], y=new_ret_df.get("Returning", 0),
+                name="Returning", marker_color=C["green"], opacity=0.82,
+                hovertemplate="<b>%{x}</b><br>Returning: %{y:,.1f}<extra></extra>",
+            ))
+            fig3.add_trace(go.Bar(
+                x=new_ret_df["month_str"], y=new_ret_df.get("New", 0),
+                name="New", marker_color=C["blue"], opacity=0.82,
+                hovertemplate="<b>%{x}</b><br>New: %{y:,.1f}<extra></extra>",
+            ))
+            fig3.update_layout(**_L(
+                title="New vs Returning Customer Revenue",
                 barmode="stack", height=320,
-                xaxis_title="Month", yaxis_title="Revenue (BD)"))
+                xaxis_title="Month", yaxis_title="Revenue",
+            ))
             st.plotly_chart(fig3, use_container_width=True)
 
-    # Pareto
+    # ── Churn Risk Distribution ────────────────────────────────────────────────
+    if "churn_risk" in cust_rfm.columns:
+        churn_counts = cust_rfm["churn_risk"].value_counts().reset_index()
+        churn_counts.columns = ["status", "count"]
+        total = churn_counts["count"].sum()
+
+        fig_churn = go.Figure(go.Pie(
+            labels=churn_counts["status"],
+            values=churn_counts["count"],
+            hole=0.60,
+            textinfo="label+percent",
+            textfont=dict(size=11, color="#1f1f1f"),
+            marker=dict(
+                colors=[CHURN_COLORS.get(s, C["faint"]) for s in churn_counts["status"]],
+                line=dict(color="#ffffff", width=2),
+            ),
+            hovertemplate="<b>%{label}</b><br>%{value:,} customers (%{percent})<extra></extra>",
+        ))
+        fig_churn.update_layout(**_L(
+            title=f"Churn Risk Distribution — {total:,} customers total",
+            height=280, showlegend=True,
+            legend=dict(orientation="h", y=-0.1, **PLOTLY["legend"]),
+        ))
+        st.plotly_chart(fig_churn, use_container_width=True)
+
+    # ── Pareto Chart ──────────────────────────────────────────────────────────
     if pareto_df is not None and not pareto_df.empty:
         fig4 = go.Figure()
-        fig4.add_trace(go.Bar(x=pareto_df["customer_pct"],
-            y=pareto_df["monetary"], name="Individual revenue",
+        fig4.add_trace(go.Bar(
+            x=pareto_df["customer_pct"], y=pareto_df["monetary"],
+            name="Individual revenue",
             marker_color=C["blue"], opacity=0.45,
-            hovertemplate="Customer top %{x:.0f}%: %{y:,.0f}<extra></extra>"))
-        fig4.add_trace(go.Scatter(x=pareto_df["customer_pct"],
-            y=pareto_df["cum_pct"], name="Cumulative %", yaxis="y2",
-            mode="lines", line=dict(color=C["orange"],width=2),
-            hovertemplate="Top %{x:.0f}% customers → %{y:.1f}% of revenue<extra></extra>"))
+            hovertemplate="Customer top %{x:.0f}%: %{y:,.0f}<extra></extra>",
+        ))
+        fig4.add_trace(go.Scatter(
+            x=pareto_df["customer_pct"], y=pareto_df["cum_pct"],
+            name="Cumulative %", yaxis="y2",
+            mode="lines", line=dict(color=C["orange"], width=2),
+            hovertemplate="Top %{x:.0f}% customers → %{y:.1f}% of revenue<extra></extra>",
+        ))
         fig4.add_vline(x=20, line_dash="dot", line_color=C["faint"],
-                       annotation_text="Top 20% customers",
-                       annotation_font_color=C["faint"])
+                       annotation_text="Top 20%", annotation_font_color=C["faint"])
         fig4.add_hline(y=80, line_dash="dot", line_color=C["yellow"],
                        annotation_text="80% of revenue", yref="y2",
                        annotation_font_color=C["yellow"])
-        fig4.update_layout(**_L(title="80/20 Pareto — Customer Revenue Distribution",
+        fig4.update_layout(**_L(
+            title="80/20 Pareto — Customer Revenue Distribution",
             height=320, xaxis_title="Customer Percentile (% of all customers)",
             yaxis_title="Individual Revenue",
-            yaxis2=dict(overlaying="y", side="right", showgrid=False,
-                        tickfont=dict(color=C["orange"],size=11),
-                        title="Cumulative Revenue %",
-                        title_font=dict(color=C["orange"],size=12), range=[0,105])))
+            yaxis2=dict(
+                overlaying="y", side="right", showgrid=False,
+                tickfont=dict(color=C["orange"], size=11),
+                title="Cumulative Revenue %",
+                title_font=dict(color=C["orange"], size=12), range=[0, 105],
+            ),
+        ))
         st.plotly_chart(fig4, use_container_width=True)
 
+    # ── Product Affinity ──────────────────────────────────────────────────────
     if affinity_df is not None and not affinity_df.empty:
-        st.markdown("**Product Affinity — Frequently Co-Purchased Pairs**")
-        aff = affinity_df.rename(columns={"product_a":"Product A","product_b":"Product B","co_purchases":"Co-Purchases"})
+        sec_hdr("Product Affinity — Frequently Co-Purchased Pairs", "🔗")
+        aff = affinity_df.rename(columns={
+            "product_a": "Product A", "product_b": "Product B", "co_purchases": "Co-Purchases",
+        })
         st.dataframe(aff.head(20), use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # ── Level 3: Traction List ─────────────────────────────────────────────────
-    sec_hdr("Win-Back Priority — Top 20 At-Risk VIPs")
+    # ── AI Win-Back Advisor ───────────────────────────────────────────────────
+    @st.fragment
+    def _ai_advisor(cust_rfm, df):
+        sec_hdr("AI Win-Back Advisor", "🤖")
+
+        _at_risk = (
+            cust_rfm[cust_rfm["churn_risk"].isin(["At Risk", "Churned"])]
+            .sort_values("monetary", ascending=False)
+            .head(20)
+        )
+
+        ai_col1, ai_col2 = st.columns([3, 1])
+        with ai_col1:
+            if not _at_risk.empty:
+                vip_names = _at_risk["customer"].astype(str).tolist()
+                selected = st.selectbox("Select a customer to analyze", vip_names, key="ai_wb_sel")
+            else:
+                selected = None
+                st.markdown('<div class="warn-box">No at-risk customers found. Use the override field below.</div>', unsafe_allow_html=True)
+            override = st.text_input("Or type any customer name / ID", placeholder="e.g. Ahmed Mohammed or 854", key="ai_wb_override")
+        with ai_col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            analyze_btn = st.button("✨ Analyze", type="primary", key="ai_wb_btn")
+
+        customer_name = override.strip() or selected
+
+        cust_row_ai = None
+        if customer_name:
+            m = cust_rfm["customer"].astype(str).str.strip() == customer_name
+            if not m.any():
+                m = cust_rfm["customer"].astype(str).str.contains(customer_name, case=False, na=False)
+            if m.any():
+                cust_row_ai = cust_rfm[m].iloc[0]
+
+        def _ck(name):
+            return f"ai_wb_{hashlib.sha256(name.encode()).hexdigest()[:16]}"
+
+        if not customer_name:
+            st.markdown('<div class="info-box">Select or type a customer name above, then click Analyze.</div>', unsafe_allow_html=True)
+        elif cust_row_ai is None:
+            st.markdown(f'<div class="warn-box">Customer <b>{customer_name}</b> not found in the dataset.</div>', unsafe_allow_html=True)
+        else:
+            ck = _ck(str(cust_row_ai["customer"]))
+
+            if analyze_btn:
+                with st.spinner("Generating win-back strategy…"):
+                    try:
+                        result = ai_engine.win_back_insight(cust_row_ai, df)
+                        st.session_state[ck] = result
+                    except ValueError as e:
+                        st.markdown(f'<div class="warn-box">⚠️ {e}</div>', unsafe_allow_html=True)
+                    except requests.exceptions.Timeout:
+                        st.markdown('<div class="warn-box">⏱ Request timed out — free-tier models can be slow. Try again.</div>', unsafe_allow_html=True)
+                    except requests.exceptions.HTTPError as e:
+                        code = e.response.status_code if e.response is not None else "?"
+                        msgs = {401: "Invalid API key.", 429: "All free models are rate-limited right now — wait a minute and try again."}
+                        st.markdown(f'<div class="warn-box">⚠️ {msgs.get(code, f"API error HTTP {code}.")}</div>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.markdown(f'<div class="warn-box">⚠️ {e}</div>', unsafe_allow_html=True)
+
+            cached = st.session_state.get(ck)
+            if cached:
+                ai_interval = f"{cust_row_ai['avg_interval_days']:.0f}d interval" if pd.notna(cust_row_ai.get("avg_interval_days")) else ""
+                st.markdown(
+                    f'<div class="stat-row">'
+                    f'<span class="stat-pill"><b>{cust_row_ai["customer"]}</b></span>'
+                    f'<span class="stat-pill">LTV <b>{cust_row_ai["monetary"]:,.0f}</b></span>'
+                    f'<span class="stat-pill">{int(cust_row_ai["recency_days"])}d since last visit</span>'
+                    f'<span class="stat-pill">{ai_interval}</span>'
+                    f'<span class="stat-pill">{badge(cust_row_ai["churn_risk"], "red" if cust_row_ai["churn_risk"] == "Churned" else "yellow")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    '<div class="kpi-card accent-purple" style="padding:16px 24px 6px 24px;margin-top:10px;">'
+                    '<div class="kpi-label">AI WIN-BACK STRATEGY</div>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(cached)
+                if st.button("↺ Regenerate", key="ai_wb_regen"):
+                    st.session_state.pop(ck, None)
+                    st.rerun()
+
+    _ai_advisor(cust_rfm, df)
+
+    st.markdown("---")
+
+    # ── Win-Back Priority ─────────────────────────────────────────────────────
+    sec_hdr("Win-Back Priority — Top 20 At-Risk VIPs", "🎯")
     at_risk_vips = (
-        cust_rfm[cust_rfm["churn_risk"].isin(["At Risk","Churned"])]
-        .sort_values("monetary", ascending=False).head(20)
+        cust_rfm[cust_rfm["churn_risk"].isin(["At Risk", "Churned"])]
+        .sort_values("monetary", ascending=False)
+        .head(20)
     )
     if at_risk_vips.empty:
-        st.markdown('<div class="success-box">No at-risk high-value customers detected.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="success-box">✅ No at-risk high-value customers detected.</div>', unsafe_allow_html=True)
     else:
         rev_ar = at_risk_vips["monetary"].sum()
-        st.markdown(f'<div class="alert-box">{len(at_risk_vips)} high-value customers at risk — combined lifetime spend: <b>{rev_ar:,.0f}</b></div>', unsafe_allow_html=True)
-        rows=[]
-        for _,r in at_risk_vips.iterrows():
-            rb = '<span class="badge b-red">Churned</span>' if r["churn_risk"]=="Churned" else '<span class="badge b-yellow">At Risk</span>'
-            ai = f"{r['avg_interval_days']:.0f}d" if r.get("avg_interval_days") else "—"
-            rows.append(f'<tr><td>{str(r["customer"])[:30]}</td><td>{r["monetary"]:,.0f}</td><td>{int(r["frequency"])}</td><td>{ai}</td><td>{int(r["recency_days"])}d ago</td><td>{rb}</td></tr>')
         st.markdown(
-            '<table class="tbl"><thead><tr><th>Customer</th><th>Lifetime Value</th><th>Visits</th><th>Usual Interval</th><th>Last Seen</th><th>Status</th></tr></thead><tbody>'+
-            "".join(rows)+'</tbody></table>', unsafe_allow_html=True)
+            f'<div class="alert-box">🚨 <b>{len(at_risk_vips)}</b> high-value customers at risk — '
+            f'combined lifetime spend: <b>{rev_ar:,.0f}</b></div>',
+            unsafe_allow_html=True,
+        )
+        rows = []
+        for _, r in at_risk_vips.iterrows():
+            rb = badge("Churned", "red") if r["churn_risk"] == "Churned" else badge("At Risk", "yellow")
+            ai = f"{r['avg_interval_days']:.0f}d" if r.get("avg_interval_days") else "—"
+            rows.append(
+                f'<tr>'
+                f'<td>{str(r["customer"])[:30]}</td>'
+                f'<td><b>{r["monetary"]:,.0f}</b></td>'
+                f'<td>{int(r["frequency"])}</td>'
+                f'<td>{ai}</td>'
+                f'<td>{int(r["recency_days"])}d ago</td>'
+                f'<td>{rb}</td>'
+                f'</tr>'
+            )
+        st.markdown(
+            tbl_wrap(
+                '<table class="tbl"><thead><tr>'
+                '<th>Customer</th><th>Lifetime Value</th><th>Visits</th>'
+                '<th>Usual Interval</th><th>Last Seen</th><th>Status</th>'
+                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+            ),
+            unsafe_allow_html=True,
+        )
         st.markdown("")
-        st.download_button("Export At-Risk List (CSV)",
+        st.download_button(
+            "⬇ Export At-Risk List (CSV)",
             at_risk_vips.to_csv(index=False).encode("utf-8"),
-            f"atrisk_{datetime.date.today()}.csv","text/csv")
+            f"atrisk_{datetime.date.today()}.csv", "text/csv",
+        )
 
-    # ── Elite: Zero-sales filter ───────────────────────────────────────────────
+    # ── Reactivation Filter ────────────────────────────────────────────────────
     st.markdown("---")
-    sec_hdr("Reactivation Filter")
-    days_inactive = st.slider("Show customers inactive for more than X days",
-                               14,180,30,7,key="zero_sales_slider")
-    inactive = cust_rfm[cust_rfm["recency_days"]>days_inactive].sort_values("monetary",ascending=False)
-    st.markdown(f'<div class="info-box">{len(inactive)} customers inactive {days_inactive}+ days — combined LTV: {inactive["monetary"].sum():,.0f}</div>', unsafe_allow_html=True)
+    sec_hdr("Reactivation Filter", "🔄")
+    days_inactive = st.number_input(
+    label="Show customers inactive for more than X days",
+    min_value=14,
+    max_value=180,
+    value=30,
+    step=7,
+    key="zero_sales_slider"
+)
+    inactive = cust_rfm[cust_rfm["recency_days"] > days_inactive].sort_values("monetary", ascending=False)
+    st.markdown(
+        f'<div class="info-box">'
+        f'<b>{len(inactive):,}</b> customers inactive {days_inactive}+ days — '
+        f'combined LTV: <b>{inactive["monetary"].sum():,.0f}</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     if not inactive.empty:
-        show = inactive[["customer","monetary","frequency","recency_days","churn_risk","rfm_segment"]].head(30).copy()
+        show = inactive[["customer", "monetary", "frequency", "recency_days", "churn_risk", "rfm_segment"]].head(30).copy()
         show["monetary"] = show["monetary"].round(1)
-        st.dataframe(show.rename(columns={"customer":"Customer","monetary":"LTV","frequency":"Visits",
-            "recency_days":"Days Inactive","churn_risk":"Risk","rfm_segment":"RFM Segment"}),
-            use_container_width=True, hide_index=True)
-        st.download_button(f"Export Reactivation List ({days_inactive}d+)",
+        st.dataframe(
+            show.rename(columns={
+                "customer": "Customer", "monetary": "LTV", "frequency": "Visits",
+                "recency_days": "Days Inactive", "churn_risk": "Risk", "rfm_segment": "RFM Segment",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        st.download_button(
+            f"⬇ Export Reactivation List ({days_inactive}d+)",
             inactive.to_csv(index=False).encode("utf-8"),
-            f"reactivation_{days_inactive}d_{datetime.date.today()}.csv","text/csv")
+            f"reactivation_{days_inactive}d_{datetime.date.today()}.csv", "text/csv",
+        )
 
-    # Segment export
-    sec_hdr("RFM Segment Export")
+    # ── RFM Segment Export ────────────────────────────────────────────────────
+    sec_hdr("RFM Segment Export", "📤")
     all_segs = sorted(cust_rfm["rfm_segment"].unique().tolist())
     chosen = st.selectbox("Select segment to export", all_segs, key="seg_export")
-    seg_data = cust_rfm[cust_rfm["rfm_segment"]==chosen]
-    c1,c2,c3 = st.columns(3)
-    with c1: st.metric("Customers",  len(seg_data))
-    with c2: st.metric("Total Revenue", f"{seg_data['monetary'].sum():,.0f}")
-    with c3: st.metric("Avg LTV", f"{seg_data['monetary'].mean():,.0f}")
+    seg_data = cust_rfm[cust_rfm["rfm_segment"] == chosen]
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Customers", len(seg_data))
+    with c2:
+        st.metric("Total Revenue", f"{seg_data['monetary'].sum():,.0f}")
+    with c3:
+        st.metric("Avg LTV", f"{seg_data['monetary'].mean():,.0f}")
+
     if not seg_data.empty:
-        st.download_button(f"Export '{chosen}' Segment (CSV)",
+        st.download_button(
+            f"⬇ Export '{chosen}' Segment (CSV)",
             seg_data.to_csv(index=False).encode("utf-8"),
-            f"segment_{chosen.lower().replace(' ','_')}_{datetime.date.today()}.csv","text/csv",
-            key=f"dl_{chosen}")
+            f"segment_{chosen.lower().replace(' ', '_')}_{datetime.date.today()}.csv",
+            "text/csv",
+            key=f"dl_{chosen}",
+        )

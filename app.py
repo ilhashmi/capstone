@@ -8,8 +8,8 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Flow ERP",
-    page_icon="🔮",
+    page_title="Flow ERP — Retail Intelligence",
+    page_icon="💠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -41,7 +41,7 @@ apply_theme()
 
 
 @st.cache_data(show_spinner=False)
-def run_pipeline(file_bytes: bytes, file_name: str, mapping_frozen: tuple, next_week: bool):
+def run_pipeline(file_bytes, file_name, mapping_frozen, next_week):
     buf    = io.BytesIO(file_bytes)
     df_raw = load_file(buf, file_name)
     df     = preprocess(df_raw, dict(mapping_frozen))
@@ -107,52 +107,86 @@ def run_pipeline(file_bytes: bytes, file_name: str, mapping_frozen: tuple, next_
     )
 
 
-# Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## Flow ERP")
-    st.caption("Inventory · Finance · Customer Intelligence")
-    st.divider()
+    st.markdown('<div class="sidebar-logo">', unsafe_allow_html=True)
+    st.image("logo_flow.png", width=130)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Upload sales file", type=["csv", "xlsx", "xls"])
-
-
-# Welcome ───────────────────────────────────────────────────────────────────
-if uploaded is None:
-    st.markdown("## Flow ERP — Control Tower")
-    st.markdown(
-        "Upload a CSV or Excel sales export in the sidebar, map your columns, "
-        "and click **Run Analysis** to activate all three modules."
+    st.markdown('<div class="sidebar-label">Data Source</div>', unsafe_allow_html=True)
+    uploaded = st.file_uploader(
+        "Upload sales file",
+        type=["csv", "xlsx", "xls"],
+        label_visibility="collapsed",
+        help="CSV or Excel export from your POS / ERP system",
     )
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(
-            '<div class="info-box">'
-            '<b>📦 Inventory Intelligence</b><br>'
-            'LightGBM quantile forecasting (25/50/75 percentile) · '
-            'ABC×XYZ portfolio classification · Lifecycle staging</div>',
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            '<div class="info-box">'
-            '<b>💰 Financial Dashboard</b><br>'
-            'P&amp;L · Gross margin · COGS trend · Branch benchmarking · '
-            'Employee performance · Basket analytics</div>',
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            '<div class="info-box">'
-            '<b>👤 Customer Intelligence</b><br>'
-            'RFM quintile scoring · LightGBM churn risk · '
-            'Win-back priority list · Retention rate · Product affinity</div>',
-            unsafe_allow_html=True,
-        )
+
+
+# ── Welcome Screen ───────────────────────────────────────────────────────────
+if uploaded is None:
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("""
+        <div class="fc fc-blue">
+            <span class="fc-icon">📦</span>
+            <div class="fc-title">Inventory Intelligence</div>
+            <div class="fc-desc">
+                AI-driven demand forecasting with confidence intervals,
+                automated portfolio classification, and lifecycle staging.
+                Know what to order — and when.
+            </div>
+            <div class="fc-tags">
+                <span class="fc-tag">Quantile Regression</span>
+                <span class="fc-tag">ABC Classification</span>
+                <span class="fc-tag">XYZ Volatility</span>
+                <span class="fc-tag">Lifecycle Staging</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("""
+        <div class="fc fc-green">
+            <span class="fc-icon">💰</span>
+            <div class="fc-title">Financial Dashboard</div>
+            <div class="fc-desc">
+                Full P&amp;L view, gross margin trends, COGS analysis,
+                branch benchmarking, and employee performance metrics.
+                One source of truth for leadership.
+            </div>
+            <div class="fc-tags">
+                <span class="fc-tag">P&amp;L Summary</span>
+                <span class="fc-tag">Gross Margin</span>
+                <span class="fc-tag">Branch Analysis</span>
+                <span class="fc-tag">Basket Analytics</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col3:
+        st.markdown("""
+        <div class="fc fc-teal">
+            <span class="fc-icon">👤</span>
+            <div class="fc-title">Customer Intelligence</div>
+            <div class="fc-desc">
+                RFM quintile segmentation, LightGBM churn prediction,
+                win-back priority lists, and product affinity mining.
+                Retain more, acquire smarter.
+            </div>
+            <div class="fc-tags">
+                <span class="fc-tag">RFM Segments</span>
+                <span class="fc-tag">Churn Risk AI</span>
+                <span class="fc-tag">Win-Back List</span>
+                <span class="fc-tag">Product Affinity</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.stop()
 
 
-# Column mapping ─────────────────────────────────────────────────────────────
+# ── Column Mapping ────────────────────────────────────────────────────────────
 with st.sidebar:
     uploaded.seek(0)
     try:
@@ -160,69 +194,90 @@ with st.sidebar:
     except Exception as e:
         st.error(str(e)); st.stop()
 
-    st.success(f"✓ {len(df_peek):,} rows · {df_peek.shape[1]} cols")
+    st.markdown(
+        f'<div class="success-box" style="margin:8px 0 12px;font-size:12px;">'
+        f'✓ <b>{len(df_peek):,}</b> rows · <b>{df_peek.shape[1]}</b> columns detected'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
     sug      = smart_detect(df_peek)
     all_cols = ["(none)"] + list(df_peek.columns)
 
-    st.markdown("**Column Mapping**")
+    st.markdown('<div class="sidebar-label">Column Mapping</div>', unsafe_allow_html=True)
 
     def _col(label, key, req=False):
         default = sug.get(key)
         idx = all_cols.index(default) if default in all_cols else 0
-        return st.selectbox(f"{label}{' *' if req else ''}", all_cols, index=idx, key=f"col_{key}")
+        marker = " *" if req else ""
+        return st.selectbox(
+            f"{label}{marker}",
+            all_cols, index=idx, key=f"col_{key}",
+        )
 
-    col_id   = _col("Product ID",          "id",       req=True)
-    col_name = _col("Product Name",         "name",     req=True)
-    col_cat  = _col("Category",             "category", req=True)
-    col_qty  = _col("Qty",                  "qty",      req=True)
-    col_date = _col("Date / Time",          "date",     req=True)
-    col_sid  = _col("Sale / Transaction ID","sale_id",  req=True)
+    col_id   = _col("Product ID",           "id",       req=True)
+    col_name = _col("Product Name",          "name",     req=True)
+    col_cat  = _col("Category",              "category", req=True)
+    col_qty  = _col("Qty",                   "qty",      req=True)
+    col_date = _col("Date / Time",           "date",     req=True)
+    col_sid  = _col("Sale / Transaction ID", "sale_id",  req=True)
 
     with st.expander("Financial columns"):
         col_sub  = _col("Subtotal / Revenue", "subtotal")
         col_cost = _col("Cost (COGS)",         "cost")
-        col_pft  = _col("Profit",             "profit")
-        col_sp   = _col("Selling Price",      "selling_price")
+        col_pft  = _col("Profit",              "profit")
+        col_sp   = _col("Selling Price",       "selling_price")
 
     with st.expander("Operations & Customer"):
-        col_br   = _col("Branch",             "branch")
-        col_emp  = _col("Employee",           "employee")
-        col_cust = _col("Customer Name",      "customer")
-        col_cid  = _col("Customer ID",        "customer_id")
+        col_br   = _col("Branch",          "branch")
+        col_emp  = _col("Employee",        "employee")
+        col_cust = _col("Customer Name",   "customer")
+        col_cid  = _col("Customer ID",     "customer_id")
 
-    mapping = {k:v for k,v in [
-        ("id",col_id),("name",col_name),("category",col_cat),
-        ("qty",col_qty),("date",col_date),("sale_id",col_sid),
-        ("subtotal",col_sub),("cost",col_cost),("profit",col_pft),
-        ("branch",col_br),("employee",col_emp),("selling_price",col_sp),
-        ("customer",col_cust),("customer_id",col_cid),
+    mapping = {k: v for k, v in [
+        ("id", col_id), ("name", col_name), ("category", col_cat),
+        ("qty", col_qty), ("date", col_date), ("sale_id", col_sid),
+        ("subtotal", col_sub), ("cost", col_cost), ("profit", col_pft),
+        ("branch", col_br), ("employee", col_emp), ("selling_price", col_sp),
+        ("customer", col_cust), ("customer_id", col_cid),
     ] if v != "(none)"}
 
-    missing = [k for k in ["id","name","category","qty","date","sale_id"] if k not in mapping]
+    missing = [k for k in ["id", "name", "category", "qty", "date", "sale_id"] if k not in mapping]
     if missing:
         st.error(f"Map required columns: {', '.join(missing)}")
         st.stop()
 
     st.divider()
-    st.markdown("**Forecast Horizon**")
+    st.markdown('<div class="sidebar-label">Forecast Horizon</div>', unsafe_allow_html=True)
     horizon   = st.radio(
         "Predict for",
         ["Next Month", "Next Week"],
         help="Next Week scales the monthly model by 1/4.33 (proportional disaggregation).",
+        label_visibility="collapsed",
     )
     next_week = horizon == "Next Week"
+
+    st.markdown(
+        f'<div style="font-size:11px;color:#6b6b6b;padding:4px 0 10px;">'
+        f'Horizon: <b style="color:#0070cc">{horizon}</b></div>',
+        unsafe_allow_html=True,
+    )
 
     run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
 
 
-# Run pipeline ──────────────────────────────────────────────────────────────
+# ── Run Pipeline ──────────────────────────────────────────────────────────────
 if not run_btn and "R" not in st.session_state:
-    st.info("Map your columns in the sidebar, then click **Run Analysis**.")
+    st.markdown("""
+    <div class="info-box" style="margin-top:12px">
+        Map your columns in the sidebar, then click <b>Run Analysis</b> to activate all three modules.
+    </div>
+    """, unsafe_allow_html=True)
     st.stop()
 
 if run_btn or "R" not in st.session_state:
     uploaded.seek(0)
-    with st.spinner("Running analysis…"):
+    with st.spinner("Running analysis — this may take a few seconds…"):
         try:
             R = run_pipeline(
                 uploaded.read(), uploaded.name,
@@ -237,11 +292,11 @@ if run_btn or "R" not in st.session_state:
 R = st.session_state["R"]
 horizon_label = "Next Week" if R.next_week else "Next Month"
 
-# Tabs ──────────────────────────────────────────────────────────────────────
+# ── Module Tabs ───────────────────────────────────────────────────────────────
 tab_inv, tab_fin, tab_cust = st.tabs([
-    "📦  Inventory Intelligence",
-    "💰  Financial Dashboard",
-    "👤  Customer Intelligence",
+    "📦 Inventory Intelligence",
+    "💰 Financial Dashboard",
+    "👤 Customer Intelligence",
 ])
 
 with tab_inv:

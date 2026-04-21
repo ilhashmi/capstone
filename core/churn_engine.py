@@ -31,14 +31,13 @@ FALLBACK_AT_RISK  =  90
 
 # Helpers ──────────────────────────────────────────────────────────────────
 
-def _named(df: pd.DataFrame) -> pd.DataFrame:
+def _named(df):
     return df[df["is_named"] & (df["qty"] > 0)].copy()
 
 
 # 1. CUSTOMER TABLE ────────────────────────────────────────────────────────
 
-def build_customer_table(df: pd.DataFrame, baskets: pd.DataFrame,
-                         snapshot: pd.Timestamp = None) -> pd.DataFrame:
+def build_customer_table(df, baskets, snapshot: pd.Timestamp = None):
     if snapshot is None:
         snapshot = pd.Timestamp(df["date"].max()) + pd.Timedelta(days=1)
 
@@ -93,14 +92,9 @@ def build_customer_table(df: pd.DataFrame, baskets: pd.DataFrame,
 
 # 2. RFM SCORING ──────────────────────────────────────────────────────────
 
-def rfm_score(cust: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assign 1–5 quintile scores for Recency (inverted), Frequency, Monetary.
-    Combine into rfm_score (3–15) and map to named segments.
-    """
+def rfm_score(cust):
     df = cust.copy()
-
-    def _qcut5(s: pd.Series, inv: bool = False) -> pd.Series:
+    def _qcut5(s, inv: bool = False):
         try:
             labels = [5, 4, 3, 2, 1] if inv else [1, 2, 3, 4, 5]
             return pd.qcut(s.rank(method="first"), 5, labels=labels).astype(int)
@@ -129,7 +123,7 @@ def rfm_score(cust: pd.DataFrame) -> pd.DataFrame:
 
 # 3. CHURN RISK CLASSIFIER ─────────────────────────────────────────────────
 
-def churn_risk(cust: pd.DataFrame) -> pd.DataFrame:
+def churn_risk(cust):
     df = cust.copy()
 
     # Step 1: rule-based labels (training signal) ──────────────────────
@@ -171,7 +165,7 @@ def churn_risk(cust: pd.DataFrame) -> pd.DataFrame:
             n_estimators=200, max_depth=4, learning_rate=0.05,
             num_leaves=15, min_child_samples=3,
             subsample=0.8, colsample_bytree=0.8,
-            class_weight="balanced",   # handle imbalanced churn labels
+            class_weight="balanced",   
             verbose=-1, n_jobs=-1,
         )
         clf.fit(df[CHURN_FEATURES], df["_label"])
@@ -187,7 +181,7 @@ def churn_risk(cust: pd.DataFrame) -> pd.DataFrame:
 
 # 4. RETENTION RATE ────────────────────────────────────────────────────────
 
-def customer_retention_rate(df: pd.DataFrame) -> pd.DataFrame:
+def customer_retention_rate(df):
     named         = _named(df)
     named["month_str"] = named["date"].dt.strftime("%Y-%m")
     months        = sorted(named["month_str"].unique())
@@ -210,7 +204,7 @@ def customer_retention_rate(df: pd.DataFrame) -> pd.DataFrame:
 
 # 5. NEW VS RETURNING ──────────────────────────────────────────────────────
 
-def new_vs_returning(df: pd.DataFrame, baskets: pd.DataFrame) -> pd.DataFrame:
+def new_vs_returning(df, baskets):
     named_b = baskets[baskets["is_named"] & ~baskets["is_return"]].copy()
     if named_b.empty:
         return pd.DataFrame()
@@ -235,7 +229,7 @@ def new_vs_returning(df: pd.DataFrame, baskets: pd.DataFrame) -> pd.DataFrame:
 
 # 6. PARETO ────────────────────────────────────────────────────────────────
 
-def pareto_customers(cust: pd.DataFrame) -> pd.DataFrame:
+def pareto_customers(cust):
     df = cust.sort_values("monetary", ascending=False).copy()
     df["cum_revenue"]  = df["monetary"].cumsum()
     df["cum_pct"]      = df["cum_revenue"] / df["monetary"].sum() * 100
@@ -245,7 +239,7 @@ def pareto_customers(cust: pd.DataFrame) -> pd.DataFrame:
 
 # 7. PRODUCT AFFINITY ──────────────────────────────────────────────────────
 
-def product_affinity(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+def product_affinity(df, top_n: int = 20):
     multi_sids = (df.groupby("sale_id")["base_id"]
                     .count().loc[lambda x: x > 1].index)
     multi = df[df["sale_id"].isin(multi_sids) & (df["qty"] > 0)].copy()
@@ -267,8 +261,7 @@ def product_affinity(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
 
 # 8. EXECUTIVE SUMMARY ─────────────────────────────────────────────────────
 
-def executive_summary(cust_rfm: pd.DataFrame, crr_df: pd.DataFrame,
-                      snapshot: pd.Timestamp) -> dict:
+def executive_summary(cust_rfm, crr_df,snapshot):
     active_90    = cust_rfm[cust_rfm["recency_days"] <= 90]
     at_risk_pct  = (cust_rfm["churn_risk"] == "At Risk").mean()  * 100
     churned_pct  = (cust_rfm["churn_risk"] == "Churned").mean()  * 100
